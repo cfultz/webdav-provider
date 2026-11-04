@@ -1,0 +1,84 @@
+name: Obtainium Sync & Release
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Checks for upstream changes daily at midnight
+  workflow_dispatch: # Allows you to trigger it manually
+  push:
+    branches: [ "master", "main" ]
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Pulls full history for merging
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync with Upstream
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git remote add upstream https://github.com/alexbakker/webdav-provider.git
+          git fetch upstream
+          
+          # Try to merge upstream. If it fails due to conflict, abort merge but continue the build
+          git merge upstream/master --no-edit || { git merge --abort; echo "Merge conflict, proceeding with existing code."; }
+          
+          # Push if the merge resulted in new changes
+          git push origin HEAD || echo "No new changes to push."
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Cache Android Keystore for Obtainium
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/obtainium.keystore
+          key: android-keystore-obtainium
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Build Unsigned Release APK
+        run: ./gradlew assembleRelease
+
+      - name: Sign Release APK for Obtainium
+        run: |
+          BUILD_TOOLS_DIR=$(ls -d $ANDROID_HOME/build-tools/* | tail -1)
+          
+          # Generate a persistent keystore if it doesn't exist yet, so Obtainium updates match
+          if [ ! -f ~/.android/obtainium.keystore ]; then
+            keytool -genkey -v -keystore ~/.android/obtainium.keystore -storepass android -alias androidkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "C=US, O=Android, CN=Obtainium Sync"
+          fi
+          
+          # Sign the Release APK
+          $BUILD_TOOLS_DIR/apksigner sign --ks ~/.android/obtainium.keystore --ks-pass pass:android --key-pass pass:android app/build/outputs/apk/release/app-release-unsigned.apk
+          
+          # Rename output to remove 'unsigned' tag
+          mv app/build/outputs/apk/release/app-release-unsigned.apk app/build/outputs/apk/release/webdav-provider-release.apk
+
+      - name: Get Latest Commit Message
+        id: git_info
+        run: echo "commit_msg=$(git log -1 --pretty=%B | head -n 1)" >> $GITHUB_OUTPUT
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest-build
+          name: Latest Release Build
+          body: |
+            ### Automatically Synced Release
+            * **Update:** ${{ steps.git_info.outputs.commit_msg }}
+            
+            Ready for Obtainium.
+          files: app/build/outputs/apk/release/*.apk
